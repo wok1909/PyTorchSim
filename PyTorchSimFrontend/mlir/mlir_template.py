@@ -1005,6 +1005,65 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
         size = tile_m * ((tile_n + self.vector_lane - 1) // self.vector_lane)
         return max(size, 2) # vector load/store
 
+    # Static cap that keeps every zero-init vector store below the LLVM RISC-V
+    # vector legalizer limit of 2**16 elements. A single store at or above that
+    # count overflows a 16-bit element counter in the backend's
+    # SplitVecRes_BUILD_VECTOR path and aborts llc with
+    # "SmallVector unable to grow". Sub-threshold sizes are left intact for LLVM
+    # to legalize itself. 2**15 sits safely under the limit and evenly halves the
+    # common 2**16 case.
+    ZERO_INIT_VECTOR_THRESHOLD = 32768
+
+    def _zero_init_chunk_sizes(self, size):
+        """Split a per-lane zero-init vector of `size` elements into chunks that
+        are each <= ZERO_INIT_VECTOR_THRESHOLD. Returns the original size
+        unchanged when it already fits. Guarantees every chunk has >= 2 elements
+        (get_spad_size_per_lane floors at 2; a 1-element vector store is invalid
+        for the gemmini lowering)."""
+        threshold = self.ZERO_INIT_VECTOR_THRESHOLD
+        if size <= threshold:
+            return [size]
+        sizes = []
+        offset = 0
+        while offset < size:
+            sizes.append(min(threshold, size - offset))
+            offset += threshold
+        if len(sizes) >= 2 and sizes[-1] < 2:
+            sizes[-2] -= 1
+            sizes[-1] += 1
+        return sizes
+
+    def emit_chunked_zero_init(self, buffer_name, size, mlir_shape, data_stype,
+                               index_prefix="0", indent_size=6):
+        """Emit MLIR that zero-initializes `size` per-lane elements of
+        `buffer_name`, splitting into <= ZERO_INIT_VECTOR_THRESHOLD-sized stores.
+
+        A single `affine.vector_store` of the full per-lane vector overflows the
+        LLVM RISC-V vector legalizer once the element count reaches 2**16. The
+        stores are emitted at flat per-lane offsets (offset = running prefix sum)
+        placed in the innermost index position, with the buffer's leading indices
+        supplied verbatim via `index_prefix` (e.g. "0" for a 2-D buffer,
+        "0, 0" for 3-D, "%c0, %c0, %c0" for the conv 4-D buffer). The index
+        `[<prefix>, offset]` flattens to the same linear address as the original
+        single store at `[<prefix>, 0]`, so the chunked stores cover exactly the
+        same elements. The offset may exceed the innermost dimension extent --
+        that is expected and matches the original store, which itself writes a
+        vector longer than one row."""
+        chunk_sizes = self._zero_init_chunk_sizes(size)
+        san = buffer_name.lstrip("%")
+        pad = " " * indent_size
+        lines = []
+        for s in sorted(set(chunk_sizes)):
+            lines.append(f"%vzi_{san}_{s} = arith.constant dense<0.0> : "
+                         f"vector<{s}x{data_stype}>")
+        offset = 0
+        for s in chunk_sizes:
+            lines.append(f"affine.vector_store %vzi_{san}_{s}, "
+                         f"{buffer_name}[{index_prefix}, {offset}] : {mlir_shape}, "
+                         f"vector<{s}x{data_stype}>")
+            offset += s
+        return ("\n" + pad).join(lines)
+
     def load_epilogue(self, name: str, index: sympy.Expr):
         dram_var = self.kernel_group.args.input(name)
         dram_shape = mlir_common.MLIRKernelArgs.get_mlir_shape(self.buffer_types[name])
