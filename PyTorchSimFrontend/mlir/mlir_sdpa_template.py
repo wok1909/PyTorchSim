@@ -322,10 +322,83 @@ func.func @{{ KERNEL_NAME }}{{kernel.def_kernel(inputs=[query, key, value], outp
 }
 """
 
+
+# ---------------------------------------------------------------------------
+# Causal (prefill) variant. Identical to FLASH_SDPA_TEMPLATE, but masks scores
+# to a finite -1e30 where the key position is in the future of the query, BEFORE
+# the online-softmax max/exp. mul_buffer holds K@Q^T with layout [key=tile_s,
+# query=tile_l], so the mask condition is (index2 + r) > (index1 + c).
+# NOTE: the per-element axis mapping (whether a vector<chunk_size> spans keys or
+# queries within a lane) is layout-dependent and MUST be validated numerically
+# against F.scaled_dot_product_attention(is_causal=True) on a small case.
+# ---------------------------------------------------------------------------
+_CAUSAL_MASK_BLOCK = r"""
+          // ---- Causal mask: score = -1e30 where global_key > global_query ----
+          // qpos_buffer[0,0] holds this lane's query position = index1 + lane_id
+          // (filled once per query-tile via MVIN of a host iota along vlane_split_axis=0).
+          %qpos_lane   = affine.vector_load %qpos_buffer[0, 0] : {{ qpos_desc.get_mlir_shape(data_stype) }}, vector<2x{{ data_stype }}>
+          %qpos_scalar = vector.extract %qpos_lane[0] : {{ data_stype }} from vector<2x{{ data_stype }}>
+          %qpos_bcast  = vector.broadcast %qpos_scalar : {{ data_stype }} to vector<{{ chunk_size }}x{{ data_stype }}>
+          affine.for %mindex = 0 to {{ tile_s }} step {{ chunk_size }} {
+            // within-lane key positions: index2 + mindex + (0..chunk_size-1)
+            %kbase_idx  = arith.addi %index2, %mindex : index
+            %kbase_i32  = arith.index_cast %kbase_idx : index to i32
+            %kbase_f    = arith.sitofp %kbase_i32 : i32 to {{ data_stype }}
+            %kbase_vec  = vector.broadcast %kbase_f : {{ data_stype }} to vector<{{ chunk_size }}x{{ data_stype }}>
+            %kiota_idx  = vector.step : vector<{{ chunk_size }}xindex>
+            %kiota_i32  = arith.index_cast %kiota_idx : vector<{{ chunk_size }}xindex> to vector<{{ chunk_size }}xi32>
+            %kiota_f    = arith.sitofp %kiota_i32 : vector<{{ chunk_size }}xi32> to vector<{{ chunk_size }}x{{ data_stype }}>
+            %kpos_vec   = arith.addf %kbase_vec, %kiota_f : vector<{{ chunk_size }}x{{ data_stype }}>
+            // mask iff global_key > global_query
+            %mask_pred  = arith.cmpf ogt, %kpos_vec, %qpos_bcast : vector<{{ chunk_size }}x{{ data_stype }}>
+            %cur_scores = affine.vector_load %mul_buffer[0, %mindex] : {{ mul_tile_desc.get_mlir_shape(data_stype) }}, vector<{{ chunk_size }}x{{ data_stype }}>
+            %masked     = arith.select %mask_pred, %v_neg_inf_c, %cur_scores : vector<{{ chunk_size }}xi1>, vector<{{ chunk_size }}x{{ data_stype }}>
+            affine.vector_store %masked, %mul_buffer[0, %mindex] : {{ mul_tile_desc.get_mlir_shape(data_stype) }}, vector<{{ chunk_size }}x{{ data_stype }}>
+          }
+          // ---- end causal mask ----
+"""
+# Inject the per-lane query-position MVIN (once per query-tile) into the causal
+# template, just before the KV loop. The marker is the score-buffer init that
+# opens each KV-loop body's predecessor region.
+_QPOS_MVIN = r"""
+        // Per-lane query position iota for this query-tile (qpos[c] = index1 + c).
+        %qpos_dram_offset = affine.apply {{ qpos_offset_map }}(%index1)
+        {{ kernel.def_dma_op("MVIN", "qpos", [], qpos_desc, indent_size=8, dram_stride=qpos_dram_stride, dram_offset="qpos_dram_offset") }}
+"""
+FLASH_SDPA_CAUSAL_TEMPLATE = (
+    FLASH_SDPA_TEMPLATE
+    # add qpos as the 4th kernel input (DRAM iota = query positions)
+    .replace(
+        'inputs=[query, key, value], outputs=[out], names_str="query, key, value, out"',
+        'inputs=[query, key, value, qpos], outputs=[out], names_str="query, key, value, qpos, out"',
+        1,
+    )
+    # declare the per-lane qpos SRAM buffer
+    .replace(
+        '  {{ kernel.def_sram_buffer("value", v_tile_desc, indent_size=2) }}\n',
+        '  {{ kernel.def_sram_buffer("value", v_tile_desc, indent_size=2) }}\n  {{ kernel.def_sram_buffer("qpos", qpos_desc, indent_size=2) }}\n',
+        1,
+    )
+    # MVIN the per-lane query iota once per query-tile, before the KV loop
+    .replace(
+        "        affine.for %index2 = 0 to {{ s }} step {{ tile_s }} {",
+        _QPOS_MVIN + "        affine.for %index2 = 0 to {{ s }} step {{ tile_s }} {",
+        1,
+    )
+    # inject the causal mask before the online-softmax max reduction
+    .replace(
+        "          // Find new max.",
+        _CAUSAL_MASK_BLOCK + "          // Find new max.",
+        1,
+    )
+)
+
+
 class MLIRFlashSDPATemplate(MLIRTemplate):
-    def __init__(self, input_nodes, layout, scale, input_reorder=None):
+    def __init__(self, input_nodes, layout, scale, input_reorder=None, is_causal=False):
         super().__init__("kernel", input_nodes, layout, input_reorder)
         self.scale = scale
+        self.is_causal = is_causal
 
     def render(self,
                kernel: MLIRTemplateKernel,
@@ -337,6 +410,9 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
 
         # Except for kernel, other arguments are usually None.
         query, key, value, out, q_tensor, k_tensor, v_tensor, out_tensor, b, l, s, e, ev, n_extra_node, n_prologue_node = self.extract_info(template_buffer_node, epilogue_nodes, prologue_nodes)
+
+        # Causal mask uses a 4th input (per-lane query-position iota); None for non-causal.
+        qpos = self.input_nodes[3] if self.is_causal else None
 
         if tile_info is None:
             tile_l, tile_s, tile_e, subtile_l, subtile_s, subtile_e = self.select_tile(kernel, l, s, e, n_extra_node, 0, n_prologue_node)[0]
@@ -353,6 +429,10 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
             raise NotImplementedError("FLASH_SDPA_REDUCTION_TEMPLATE is not implemented yet.")
         elif prologue_nodes:
             raise NotImplementedError("FLASH_SDPA_PROLOGUE_TEMPLATE is not implemented yet.")
+        elif self.is_causal:
+            template = FLASH_SDPA_CAUSAL_TEMPLATE
+            epilogue_dim_aliasing = {"index0":"index0", "index1":"index1", "index2": "index2", "index3": "index3"}
+            nr_rdim = 0
         else:
             template = FLASH_SDPA_TEMPLATE
             epilogue_dim_aliasing = {"index0":"index0", "index1":"index1", "index2": "index2", "index3": "index3"}
@@ -447,6 +527,15 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         sum_desc.set_tile_size_stride(sum_size, sum_stride)
         sum_desc.set_name("sum_buffer")
 
+        # Per-lane query-position buffer (causal mask only): qpos_buffer[lane] = index1 + lane_id.
+        # Same per-lane layout as max/sum (vlane_split_axis=0, [tile_l, 2]).
+        vlane_split_axis = 0
+        qpos_size = [tile_l, 2]
+        qpos_stride = [2, 1]
+        qpos_desc = mlir_common.MLIRMultiDimTile(qpos_size, kernel.vector_lane, vlane_split_axis, vlane_stride)
+        qpos_desc.set_tile_size_stride(qpos_size, qpos_stride)
+        qpos_desc.set_name("qpos_buffer")
+
         # For reduction
         chunk_size = 16
 
@@ -460,6 +549,11 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         k_offset_map   = _make_offset_map(k_dram_stride,   k_tile_desc.offset)
         v_offset_map   = _make_offset_map(v_dram_stride,   v_tile_desc.offset)
         out_offset_map = _make_offset_map(out_dram_stride, 0)
+
+        # Causal-mask iota: [l, 2] DRAM tensor (row i = [i, i]), distributed one row
+        # per lane. Tile is [tile_l, 2]; base address for query-tile index1 is index1*2.
+        qpos_dram_stride = [2, 1]
+        qpos_offset_map  = _make_offset_map([2], 0)
 
         # Keep out_idx only for epilogue_info (not in render_options)
         out_idx = [loop_dim[0]*out_stride[0], loop_dim[1]*out_stride[1], loop_dim[3]*out_stride[2]]
@@ -478,6 +572,7 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
             query = query,
             key = key,
             value = value,
+            qpos = qpos,
             out = out,                         # Inputs and output (dram)
             q_dram_stride  = q_dram_stride,
             k_dram_stride  = k_dram_stride,
@@ -496,6 +591,10 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
             sum_desc = sum_desc,               # Intermediate buffer descriptions (sram)
             scale = self.scale,
             chunk_size = chunk_size,
+            is_causal = self.is_causal,
+            qpos_desc = qpos_desc,
+            qpos_dram_stride = qpos_dram_stride,
+            qpos_offset_map = qpos_offset_map,
             input_reorder = self.input_reorder # ETC
         )
 
