@@ -874,6 +874,8 @@ class ExtensionOverrides(common.OpOverrides):
         shape = f"vector<{tile_size}x{ret_type}>" if tile_size > 1 else ret_type
         opcode = f'arith.add{ret_type[0]}'
         op_str = f'{opcode} %{operand1}, %{operand2}'
+        if ret_type.startswith('f'):
+            op_str += ' fastmath<contract>'  # let LLVM fuse mul+add -> (widening) FMA (vfwmacc), removing reduction SEW-toggle
         return format_mlir_op(op_str, shape, **kwargs), [tile_size, ret_type]
 
     @staticmethod
@@ -890,6 +892,8 @@ class ExtensionOverrides(common.OpOverrides):
         shape = f"vector<{tile_size}x{ret_type}>" if tile_size > 1 else ret_type
         opcode = f'arith.mul{ret_type[0]}'
         op_str = f'{opcode} %{operand1}, %{operand2}'
+        if ret_type.startswith('f'):
+            op_str += ' fastmath<contract>'  # let LLVM fuse mul+add -> (widening) FMA (vfwmacc), removing reduction SEW-toggle
         return format_mlir_op(op_str, shape, **kwargs), [tile_size, ret_type]
 
     @staticmethod
