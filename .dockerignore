@@ -1,0 +1,17 @@
+.git
+.github
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local build artifacts
+build/
+outputs/
+togsim_results/
+PyTorchSimDevice/build/
+PyTorchSimDevice/torch_openreg/_C*.so
+PyTorchSimDevice/torch_openreg/lib/
+
+# Local experiments/logs
+validation/gemm_candidates/

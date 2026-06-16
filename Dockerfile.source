@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1.4
+ARG BASE_IMAGE=pytorchsim-base-source:pt2.8
+FROM ${BASE_IMAGE}
+
+WORKDIR /workspace
+
+# Prepare PyTorchSim project.
+COPY . /workspace/PyTorchSim
+
+RUN VERIFY_ONLY=1 bash /workspace/PyTorchSim/scripts/prepare_togsim_extern.sh /workspace/PyTorchSim
+
+RUN cd /workspace/PyTorchSim/TOGSim && \
+    mkdir -p build && \
+    cd build && \
+    conan install .. --build=missing && \
+    cmake .. && \
+    make -j"$(nproc)"
+
+RUN set -euo pipefail; \
+    if [[ -d /workspace/PyTorchSim/PyTorchSimDevice ]]; then \
+      DEVICE_DIR=/workspace/PyTorchSim/PyTorchSimDevice; \
+    elif [[ -d /workspace/PyTorchSim/PyTorchSim/PyTorchSimDevice ]]; then \
+      DEVICE_DIR=/workspace/PyTorchSim/PyTorchSim/PyTorchSimDevice; \
+    else \
+      echo "PyTorchSimDevice not found after COPY. Directory listing:" >&2; \
+      ls -la /workspace/PyTorchSim >&2; \
+      exit 1; \
+    fi; \
+    cd "${DEVICE_DIR}" && python -m pip install --no-build-isolation -e .
+
+WORKDIR /workspace/PyTorchSim

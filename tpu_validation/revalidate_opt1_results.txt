@@ -1,0 +1,18 @@
+=== GEMM ===
+gemm N=512 cycles=5827
+gemm N=1024 cycles=23298
+gemm N=2048 cycles=109602
+gemm N=4096 cycles=652354
+gemm N=8192 cycles=4428100
+=== GEMV ===
+gemv N=1024 cycles=7189
+gemv N=2048 cycles=27418
+gemv N=4096 cycles=111193
+gemv N=8192 cycles=405430
+gemv N=16384 cycles=1399100
+=== VADD ===
+vadd N=1048576 cycles=17066
+vadd N=4194304 cycles=67370
+vadd N=16777216 cycles=268590
+vadd N=67108864 cycles=1073454
+REVAL_DONE

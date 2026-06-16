@@ -1,0 +1,5 @@
+# tensorboard virtualenv (hundreds of MB of binaries) — do not track
+.tb_venv/
+# large raw sim stdout logs (15MB+ each) — regenerable, do not track
+*.log
+*.trace

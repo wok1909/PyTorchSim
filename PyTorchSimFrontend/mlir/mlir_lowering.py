@@ -6,7 +6,7 @@ from torch._inductor.lowering import lowerings, index_impl
 from torch._inductor.kernel.mm_common import mm_args
 # from torch._inductor.select_algorithm import ExternKernelChoice
 from torch._inductor import ir
-from torch._inductor.virtualized import V
+from torch._inductor.virtualized import V, ops
 from torch._inductor.ir import TensorBox
 from PyTorchSimFrontend.extension_op import MLIRExternKernelChoice
 from PyTorchSimFrontend.mlir.mlir_gemm_template import MLIRGemmTemplate
@@ -65,7 +65,25 @@ def tuned_flash_sdpa(
     # into primitive ops (matmul/softmax) before reaching this lowering.
     scale = calculate_scale(query, scale)
     N, Hq, H, L, S, E, Ev, layout, query, key, value = flash_sdpa_args(query, key, value)
-    mlir_template = MLIRFlashSDPATemplate([query, key, value], layout, scale)
+    input_nodes = [query, key, value]
+    if is_causal:
+        # Per-lane query-position iota: [L, 2] f32 (row i = [i, i]), MVIN'd one row
+        # per lane by the causal template so lane c reads query position index1 + c.
+        # Build the iota directly as a Pointwise on the kernel's device and realize it
+        # into a ComputedBuffer (a real kernel arg in V.graph.buffers). Avoids the
+        # constant pool (KeyError in get_arg_info) and the CPU empty_strided_cpu issue.
+        # qpos[row, col] = float(row) = query position; both columns hold the same value.
+        L_int = int(L)
+        def _iota_inner(idx):
+            return ops.to_dtype(ops.index_expr(idx[0], torch.int64), torch.float32)
+        qpos_tb = ir.Pointwise.create(
+            device=query.get_device(), dtype=torch.float32,
+            inner_fn=_iota_inner, ranges=[L_int, 2],
+        )
+        qpos_tb.realize()
+        qpos_node = ir.ExternKernel.require_stride1(qpos_tb)
+        input_nodes = [query, key, value, qpos_node]
+    mlir_template = MLIRFlashSDPATemplate(input_nodes, layout, scale, is_causal=is_causal)
     return (mlir_template.generate().output_node(), None, None, None, None, None, None, None, None)
 
 

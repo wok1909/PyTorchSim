@@ -1,0 +1,11 @@
+=== PREFILL (causal flash template, fp32, B=1, Hq5/Hkv1/D128) ===
+prefill S=512 cycles=38789
+prefill S=1024 cycles=148279
+prefill S=2048 cycles=558442
+=== DECODE (test_gqa_decode, fp16, B=1, LLAMA4_TP8, tile=512) ===
+decode S=512 cycles=4199
+decode S=1024 cycles=5412
+decode S=2048 cycles=7849
+decode S=4096 cycles=12747
+decode S=8192 cycles=21928
+SWEEP_DONE

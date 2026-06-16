@@ -1,0 +1,5 @@
+{"exp": "A", "B": 1, "S": 512, "dtype": "bf16", "avg_us": 31.2, "tflops": 10.8, "source": "preempted_run_1"}
+{"exp": "A", "B": 1, "S": 512, "dtype": "bf16", "avg_us": 39.05, "tflops": 8.6, "source": "preempted_run_1"}
+{"exp": "A", "B": 2, "S": 512, "dtype": "bf16", "avg_us": 30.12, "tflops": 22.3, "source": "preempted_run_1"}
+{"exp": "A", "B": 4, "S": 512, "dtype": "bf16", "avg_us": 30.95, "tflops": 43.4, "source": "preempted_run_1"}
+{"exp": "A", "B": 8, "S": 512, "dtype": "bf16", "avg_us": 42.55, "tflops": 63.1, "source": "preempted_run_1"}

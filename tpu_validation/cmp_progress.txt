@@ -1,0 +1,6 @@
+START
+[decode 2048]
+decode_done exit=0
+[prefill 2048]
+prefill_done exit=0
+CMP_DONE
