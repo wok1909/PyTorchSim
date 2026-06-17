@@ -977,14 +977,17 @@ class MLIRTemplateKernel(MLIRKernel, BaseMLIRHardwareInfo):
         self.render_hooks[key] = (priority, generate_dma_code)
         return key
 
-    def def_sram_buffer(self, dram_name, tile_desc, id=0, indent_size=0):
+    def def_sram_buffer(self, dram_name, tile_desc, id=0, indent_size=0, dtype=None):
         # Prepare code block
         with self:
-            try:
-                dtype = self.named_nodes[dram_name].get_layout().dtype
-            except (KeyError, AttributeError, TypeError):
-                import torch
-                dtype = torch.float32
+            if dtype is None:
+                try:
+                    dtype = self.named_nodes[dram_name].get_layout().dtype
+                except (KeyError, AttributeError, TypeError):
+                    import torch
+                    dtype = torch.float32
+            elif isinstance(dtype, str):
+                dtype = mlir_common.MLIR_TO_DTYPE[dtype]
             
             tile_shape = tile_desc.get_mlir_shape(mlir_common.DTYPE_TO_MLIR[dtype])
             buffer_name = self.allocate_sram_buffer(dtype, dram_name, tile_desc, id, forced_name=dram_name)
