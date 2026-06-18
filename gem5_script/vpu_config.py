@@ -1,5 +1,11 @@
 import m5
+import os as _os
 from m5.objects import *
+
+# Env overrides for SFU (transcendental) calibration sweeps. Defaults preserve
+# prior behavior (opLat 10, issueLat default=1).
+_SFU_OPLAT = int(_os.environ.get("TORCHSIM_SFU_OPLAT", "10"))
+_SFU_ISSUELAT = _os.environ.get("TORCHSIM_SFU_ISSUELAT")
 
 class SystolicArray(MinorFU):
     unitType = "SystolicArray"
@@ -21,7 +27,9 @@ class SpecialFunctionUnit(MinorFU):
         "CustomVsin",
         "CustomVcos",
         ])
-    opLat = 10
+    opLat = _SFU_OPLAT
+    if _SFU_ISSUELAT is not None:
+        issueLat = int(_SFU_ISSUELAT)
 
 class MinorFPUnit(MinorFU):
     opClasses = minorMakeOpClassSet(

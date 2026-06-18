@@ -590,14 +590,16 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         qpos_desc.set_tile_size_stride(qpos_size, qpos_stride)
         qpos_desc.set_name("qpos_buffer")
 
-        # For reduction
-        # chunk_size drives the online-softmax reduction granularity AND the
-        # extf/truncf width in the f16 path. It must keep the f16 source EMUL of
-        # the widening converts (vfwcvt) fractional (<=mf2) so gem5's RVV decoder
-        # does not reject vd/vs2 overlap for widening ops. At VLEN=256 a f16
-        # source EMUL of mf2 = 8 elements; 16 elements (EMUL=1) triggers the
-        # "Unsupported overlap in Vs2 and Vd for Widening op" panic.
-        chunk_size = 8
+        # For reduction.
+        # chunk_size = the per-op vector width of the online-softmax loops. The
+        # sim charges 1 cycle per vector instruction regardless of width, so wider
+        # chunks => fewer loop iterations => fewer load/store/vsetvli/arith
+        # instructions => far fewer cycles (measured: 8->32 halves total cycles).
+        # Cap at 32: in the f16 path the extf widening f16->f32 at chunk=32 is
+        # source EMUL m2 -> dest m4 (legal, dest LMUL<=8); chunk=64 would be dest
+        # m8 and hits the gem5 "LMUL=8 illegal for widening" panic. Also bounded by
+        # tile_s (the loop trip count) and stays a power of 2.
+        chunk_size = max(2, min(32, tile_s))
         import os as _os
         _cs = _os.environ.get("TORCHSIM_FLASH_CHUNK")
         if _cs:
