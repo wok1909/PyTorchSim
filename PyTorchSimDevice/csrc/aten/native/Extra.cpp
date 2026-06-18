@@ -35,12 +35,14 @@ int64_t _fused_sdp_choice(
 
   // Conditions required by the MLIR FlashSDPA kernel:
   // Prefill only  : L == S  (decode has L == 1, not supported)
-  // Non-GQA       : Hq == H (equal query and KV heads)
+  // (G)QA         : Hq % H == 0  (g = Hq / H query heads per KV head; g == 1
+  //                 is plain MHA, g > 1 is grouped-query attention; the flash
+  //                 template maps query head -> KV head via floordiv(head, g))
   // No dropout    : template has no dropout implementation
   // Dense tensors : no nested tensor support
   const bool can_use_mlir_flash =
       (L == S) &&
-      (Hq == H) && !enable_gqa &&
+      (H != 0) && (Hq % H == 0) &&
       sdp::check_for_dropout(params, /*debug=*/false) &&
       sdp::check_nested_tensor(params, /*debug=*/false);
 

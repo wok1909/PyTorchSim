@@ -86,6 +86,56 @@ def _make_offset_map(strides, offset=0):
     return f"affine_map<({dim_str}) -> ({expr})>"
 
 
+def _make_offset_map_gqa(strides, head_div=1, offset=0):
+    """Like _make_offset_map, but for GQA the head dimension (d0) of a KV tensor
+    is divided down to the KV head index.
+
+    The flash kernel loops over query heads (%index0 in 0..n*hq) for all DMAs.
+    KV tensors only have n*h heads, with g = hq // h query heads sharing each KV
+    head. So a query head index0 reads KV head ``index0 floordiv g``. When
+    ``head_div`` (= g) is 1 this is identical to ``_make_offset_map``.
+
+    Args:
+        strides:  per-dimension DRAM strides; dimension 0 is the head dim.
+        head_div: g = hq // h. floordiv applied to d0 when > 1.
+        offset:   constant layout offset.
+
+    Returns:
+        MLIR affine_map string, e.g.
+        ``affine_map<(d0, d1, d2) -> ((d0 floordiv 5) * 16384 + d1 * 128 + d2)>``
+    """
+    try:
+        g = int(head_div)
+    except (TypeError, ValueError):
+        g = 1
+    if g <= 1:
+        return _make_offset_map(strides, offset)
+
+    n = len(strides)
+    terms = []
+    for j, s in enumerate(strides):
+        s = int(s)
+        if s == 0:
+            continue
+        if j == 0:
+            # Map query head index0 -> KV head index0 floordiv g.
+            terms.append(f"(d0 floordiv {g})" if s == 1
+                         else f"(d0 floordiv {g}) * {s}")
+        elif s == 1:
+            terms.append(f"d{j}")
+        else:
+            terms.append(f"d{j} * {s}")
+    try:
+        off = int(offset)
+    except (TypeError, ValueError):
+        off = 0
+    if off:
+        terms.append(str(off))
+    dim_str = ", ".join(f"d{j}" for j in range(n))
+    expr = " + ".join(terms) if terms else "0"
+    return f"affine_map<({dim_str}) -> ({expr})>"
+
+
 def flash_sdpa_args(
         query : TensorBox,
         key   : TensorBox,
@@ -611,9 +661,16 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         v_dram_stride  = [int(v_stride[0]), int(v_stride[1]), int(v_stride[2])]
         out_dram_stride = [int(out_stride[0]), int(out_stride[1]), int(out_stride[2])]
 
+        # GQA: query has hq heads (loop %index0 in 0..n*hq), KV has h heads with
+        # g = hq // h query heads per KV head. Map query head -> KV head via
+        # floordiv on the KV offset maps only. g == 1 reduces to plain MHA.
+        hq = int(query.get_layout().size[-3])
+        h  = int(key.get_layout().size[-3])
+        g  = hq // h if h else 1
+
         q_offset_map   = _make_offset_map(q_dram_stride,   q_tile_desc.offset)
-        k_offset_map   = _make_offset_map(k_dram_stride,   k_tile_desc.offset)
-        v_offset_map   = _make_offset_map(v_dram_stride,   v_tile_desc.offset)
+        k_offset_map   = _make_offset_map_gqa(k_dram_stride, g, k_tile_desc.offset)
+        v_offset_map   = _make_offset_map_gqa(v_dram_stride, g, v_tile_desc.offset)
         out_offset_map = _make_offset_map(out_dram_stride, 0)
 
         # Causal-mask iota: [l, 2] DRAM tensor (row i = [i, i]), distributed one row
