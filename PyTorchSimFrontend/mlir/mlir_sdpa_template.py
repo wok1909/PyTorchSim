@@ -175,11 +175,12 @@ def flash_sdpa_args(
             "Flash SDPA currently requires matching head dimensions between query and value (e == ev)."
         )
 
-    # Minimal GQA support (single-batch only for now).
-    # We map each query head to a KV head by grouping: hq = g * h.
+    # GQA support: map each query head to its KV head by grouping (hq = g * h).
+    # The KV DRAM offset maps apply (index0 floordiv g); this is correct for ANY
+    # batch n, because the flattened query head index0 = batch*hq + head and
+    #   index0 // g = batch*h + head // g   (since hq = g*h),
+    # which is exactly the flattened KV head index. So batched GQA is supported.
     if hq != h:
-        if n != 1:
-            raise NotImplementedError("Flash SDPA GQA is currently supported only for n == 1.")
         if (hq % h) != 0:
             raise NotImplementedError(f"Flash SDPA GQA requires hq % h == 0 (hq: {hq}, h: {h}).")
 
