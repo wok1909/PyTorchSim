@@ -1,0 +1,37 @@
+# TPU v6e (Trillium) — draft config for PyTorchSim validation
+# Spec basis (official + JAX scaling book):
+#   1 TensorCore/chip, 2 MXU/TensorCore, MXU 256x256,
+#   918 TFLOPS bf16, HBM 32GB @ 1600 GB/s, SparseCore.
+# Derived: core_freq = 918e12 / (2 flop/MAC * 256*256 * 2 MXU) = 3502 MHz.
+# Calibration knobs (not from datasheet): vpu_spad (=v4 128 for now), DRAM split.
+num_cores: 1
+core_freq_mhz: 3502
+core_stats_print_period_cycles: 200
+num_systolic_array_per_core: 2
+
+vpu_num_lanes: 256              # MXU 256x256 (systolic_size = vpu_num_lanes)
+vpu_spad_size_kb_per_lane: 512  # 512KB x 256 lanes = 128 MB (v6e VMEM ~128MiB)
+vpu_vector_length_bits: 256
+
+dram_type: ramulator2
+dram_channels: 32
+dram_req_size_byte: 32
+dram_num_burst_length: 2
+dram_stats_print_period_cycles: 200
+ramulator_config_path: ../configs/ramulator2_configs/HBM3_TPUv6e.yaml
+l2d_type: datacache
+l2d_config: S:128:128:512,32,L:T:m:W:L,A:192:4,32:0,32   # v4-identical L2 (8 MB)
+
+icnt_type: simple
+icnt_latency_cycles: 10
+icnt_freq_mhz: 3502
+icnt_injection_ports_per_core: 16
+
+pytorchsim_functional_mode: 0
+pytorchsim_timing_mode: 1
+
+codegen_mapping_strategy: autotune
+codegen_external_mapping_file: ''
+codegen_autotune_max_retry: 10
+codegen_autotune_template_topk: 4
+codegen_compiler_optimization: all

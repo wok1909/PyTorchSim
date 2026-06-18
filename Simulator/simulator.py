@@ -144,7 +144,12 @@ class FunctionalSimulator():
         base_path= f"--base-path={runtime_path}"
         os.makedirs(os.path.join(runtime_path, "indirect_access"), exist_ok=True)
         os.makedirs(os.path.join(runtime_path, "dma_access"), exist_ok=True)
-        run = f'spike --isa rv64gcv_zfh --varch=vlen:256,elen:64 {vectorlane_option} {spad_option} {kernel_address} {base_path} /workspace/riscv-pk/build/pk {target_binary} {file_path_str}'
+        # Spike's RVV VLEN must match the VLEN the kernel was compiled for
+        # (extension_config.vpu_vector_length_bits -> llc zvl{vlen}b). Previously
+        # hard-coded to vlen:256, which silently produced NaN when the config vlen
+        # was changed (e.g. 512), because the vlen-512 code ran on a vlen-256 Spike.
+        spike_vlen = extension_config.vpu_vector_length_bits
+        run = f'spike --isa rv64gcv_zfh --varch=vlen:{spike_vlen},elen:64 {vectorlane_option} {spad_option} {kernel_address} {base_path} /workspace/riscv-pk/build/pk {target_binary} {file_path_str}'
         if not silent_mode:
             logger.debug(f"[Spike] cmd> {run}")
             logger.info("[Spike] Running Spike simulator")
