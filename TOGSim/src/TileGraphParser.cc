@@ -1,4 +1,5 @@
 #include "TileGraphParser.h"
+#include <cstdlib>
 
 void printIndexMap(std::string prefix, const std::map<std::string, int>& indexMap) {
     std::ostringstream oss;
@@ -558,8 +559,28 @@ std::vector<std::shared_ptr<Tile>> TileLoopNode::get_tiles_from_iter(TileGraphPa
       std::vector<int64_t> tag_list = {0};
       std::vector<int64_t> tag_stride_list = {1};
       std::vector<int64_t> accum_tag_list;
+
+      // Opt-in VPU cycle calibration. The frontend charges one cycle per vector
+      // instruction regardless of EEW/LMUL, which over-counts the softmax VPU work
+      // relative to real TPU v6e (hardware exp/reduce units). TORCHSIM_VPU_CYCLE_SCALE
+      // (default 1.0) multiplies only VECTOR_UNIT (compute_type==0) COMP cycles so
+      // the timing model can be calibrated without touching faithful code paths.
+      // Read once. This affects TOGSim *timing only* (functional/Spike path is
+      // independent), so numerics are unchanged.
+      static const double _vpu_cycle_scale = []() {
+        const char* e = std::getenv("TORCHSIM_VPU_CYCLE_SCALE");
+        return e ? std::atof(e) : 1.0;
+      }();
+      uint32_t _comp_cycle = compute_node->get_cycle();
+      // compute_type 0 == Core::VECTOR_UNIT (see Core.h enum: VECTOR_UNIT, MATMUL, ...).
+      if (_vpu_cycle_scale != 1.0 &&
+          compute_node->get_compute_type() == 0) {
+        double _scaled = static_cast<double>(_comp_cycle) * _vpu_cycle_scale;
+        _comp_cycle = static_cast<uint32_t>(_scaled + 0.5);
+      }
+
       std::shared_ptr<Instruction> inst = std::make_shared<Instruction>(
-        Opcode::COMP, compute_node->get_cycle(),
+        Opcode::COMP, _comp_cycle,
         0, 0,
         std::vector<size_t>(), std::vector<int>(), 0,
         tag_list, tag_stride_list, accum_tag_list
