@@ -488,7 +488,12 @@ FLASH_SDPA_CAUSAL_TEMPLATE = (
     # MVIN the per-lane query iota once per query-tile, before the KV loop
     .replace(
         "        affine.for %index2 = 0 to {{ s }} step {{ tile_s }} {",
-        _QPOS_MVIN + "        affine.for %index2 = 0 to {{ s }} step {{ tile_s }} {",
+        # Causal block-skip: cap the KV loop at min(S, index1 + tile_l) so KV blocks
+        # fully in the future of the query tile are not iterated. Functionally Spike
+        # honors this directly; for TIMING, tog_generator re-extracts this min bound
+        # from the .mlir and emits a dependent loop_end that TOGSim's TileLoopNode
+        # caps per query-tile (the LLVM TOG pass drops the min's dependent term).
+        _QPOS_MVIN + "        affine.for %index2 = 0 to min affine_map<(d0) -> ({{ s }}, d0 + {{ tile_l }})>(%index1) step {{ tile_s }} {",
         1,
     )
     # Inject the causal mask right after the QK matmul and before the FUSED

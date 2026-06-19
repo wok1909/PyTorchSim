@@ -61,6 +61,22 @@ class tog_generator:
         self.node_depth_pointer -= 1
 
     def load_file(self, path):
+        # Causal block-skip: re-extract the dependent KV-loop bound from the .mlir
+        # (min(S, index_q + tile_l)) that the TOG dump dropped. Map %indexN -> loop_argNNN
+        # by emission order (affine.for %indexN count == loop_arg count, verified).
+        import os as _os, re as _re
+        self._dep_bounds = {}
+        try:
+            _mp = path.replace("_tog.py", ".mlir")
+            if _os.path.exists(_mp):
+                _txt = open(_mp).read()
+                _fors = _re.findall(r"affine\.for %(index\d+)\s*=", _txt)
+                _m = _re.search(r"affine\.for %(index\d+)\s*=\s*0 to min affine_map<\(d0\) -> \((\d+), d0 \+ (\d+)\)>\(%(index\d+)\)", _txt)
+                if _m and _m.group(1) in _fors and _m.group(4) in _fors:
+                    _kv = _fors.index(_m.group(1)); _dep = _fors.index(_m.group(4))
+                    self._dep_bounds["loop_arg%03d" % _kv] = ("loop_arg%03d" % _dep, int(_m.group(3)))
+        except Exception:
+            self._dep_bounds = {}
         self.module = import_module_from_path(self.module_name, path)
         if hasattr(self.module, "graph"):
             self.raw_graph = self.module.graph
@@ -84,7 +100,11 @@ class tog_generator:
             loop_step  = dump_data["loop_step"]
             loop_idx = dump_data["loop_index"]
             loop_type = dump_data["loop_type"]
-            new_node = loop_index_node(loop_idx, [loop_start, loop_end, loop_step, loop_type], node_id)
+            _dep = getattr(self, "_dep_bounds", {}).get(loop_idx)
+            if _dep:
+                new_node = loop_index_node(loop_idx, [loop_start, loop_end, loop_step, loop_type], node_id, dep_idx=_dep[0], dep_offset=_dep[1])
+            else:
+                new_node = loop_index_node(loop_idx, [loop_start, loop_end, loop_step, loop_type], node_id)
             new_end_node = loop_end_node(loop_idx, self.new_node_id)
             new_end_node.parent = dump_data["parents"][0]
             self.new_node_id += 1

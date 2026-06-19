@@ -220,6 +220,8 @@ class TileLoopNode : public TileNode {
   uint64_t get_start() { return _start; }
   uint64_t get_stride() { return _stride; }
   uint64_t get_end() { return _end; }
+  std::string get_dep_idx() { return _dep_idx; }
+  int64_t get_dep_offset() { return _dep_offset; }
   LoopType get_loop_type() { return _loop_type; }
   void print_node() override;
  private:
@@ -227,6 +229,8 @@ class TileLoopNode : public TileNode {
   uint64_t _stride;
   uint64_t _start;
   uint64_t _end;
+  std::string _dep_idx = "";
+  int64_t _dep_offset = 0;
   LoopType _loop_type;
   std::vector<std::shared_ptr<TileNode>> _body_node;
 };

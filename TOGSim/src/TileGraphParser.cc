@@ -1,3 +1,4 @@
+#include <tuple>
 #include "TileGraphParser.h"
 
 void printIndexMap(std::string prefix, const std::map<std::string, int>& indexMap) {
@@ -318,6 +319,10 @@ TileLoopNode::TileLoopNode(onnx::NodeProto& node) : TileNode(node) {
       _stride = attribute.i();
     } else if (attribute.name() == "torchsim_loop_idx") {
       _tile_index_name = attribute.s();
+    } else if (attribute.name() == "torchsim_dep_idx") {
+      _dep_idx = attribute.s();
+    } else if (attribute.name() == "torchsim_dep_offset") {
+      _dep_offset = attribute.i();
     } else if (attribute.name() == "torchsim_loop_type") {
       if (attribute.s() == "outer_loop") {
         _loop_type = LoopType::PARALLEL_LOOP;
@@ -574,6 +579,16 @@ std::vector<std::shared_ptr<Tile>> TileLoopNode::get_tiles_from_iter(TileGraphPa
       uint64_t start = loop_node->get_start();
       uint64_t stride = loop_node->get_stride();
       uint64_t end = loop_node->get_end();
+      /* Causal block-skip: cap this loop end to min(end, outer_idx + offset) so
+         fully-future KV blocks are not iterated (triangular, not full S^2). */
+      if (!loop_node->get_dep_idx().empty()) {
+        auto _dit = iter.find(loop_node->get_dep_idx());
+        if (_dit != iter.end()) {
+          int64_t _eff = (int64_t)_dit->second + loop_node->get_dep_offset();
+          if (_eff < 0) _eff = 0;
+          if ((uint64_t)_eff < end) end = (uint64_t)_eff;
+        }
+      }
 
       /* Create tile before enter nested loop */
       for (const auto& pair: link_map) {
@@ -836,11 +851,24 @@ TileGraphParser::TileGraphParser(std::string onnx_path, std::string attribute_pa
     spdlog::trace("[TOGParser] <Push Loop> loop_idx: {}, start: {}, end: {}, stride: {}", loop_idx, start, end, stride);
   }
 
+  /* Causal block-skip: collect loops whose upper bound depends on an outer loop
+     (KV loop end = min(S, query_idx + offset)). Future blocks are skipped below. */
+  std::vector<std::tuple<std::string,std::string,int64_t>> _dep_bounds;
+  for (int i=0;i<=last_outer_idx;i++) {
+    auto ln = std::static_pointer_cast<TileLoopNode>(_loop_nodes.at(i).front());
+    if (!ln->get_dep_idx().empty())
+      _dep_bounds.emplace_back(ln->get_idx_name(), ln->get_dep_idx(), ln->get_dep_offset());
+  }
   /* Iterate outer loop and initialize inner loop */
   for (auto iter=_tile_graph->begin(); iter!=_tile_graph->end(); ++iter) {
     std::shared_ptr<TileSubGraph> subgraph = std::make_shared<TileSubGraph>();
     subgraph->set_core_id(getCoreIdFromConfig(_attribute_config, subgraph->get_id()));
     auto indices = iter.get_indices();
+    bool _skip = false;
+    for (auto& d : _dep_bounds) {
+      if ((int64_t)indices[std::get<0>(d)] >= (int64_t)indices[std::get<1>(d)] + std::get<2>(d)) { _skip = true; break; }
+    }
+    if (_skip) continue;
     for (auto loop : _loop_nodes.at(last_outer_idx)) {
       std::shared_ptr<TileLoopNode> outer_loop = std::static_pointer_cast<TileLoopNode>(loop);
       this->clear_tag_table(); // Clear tag table for each inner loop
