@@ -433,9 +433,10 @@ _CAUSAL_MASK_BLOCK = r"""
           // ---- Causal mask: score = -1e30 where global_key > global_query ----
           // qpos_buffer[0,0] holds this lane's query position = index1 + lane_id
           // (filled once per query-tile via MVIN of a host iota along vlane_split_axis=0).
-          %qpos_lane   = affine.vector_load %qpos_buffer[0, 0] : {{ qpos_desc.get_mlir_shape(acc_stype) }}, vector<2x{{ acc_stype }}>
-          %qpos_scalar = vector.extract %qpos_lane[0] : {{ acc_stype }} from vector<2x{{ acc_stype }}>
-          %qpos_bcast  = vector.broadcast %qpos_scalar : {{ acc_stype }} to vector<{{ chunk_size }}x{{ acc_stype }}>
+          // Per-lane vle of the full chunk_size vector (all elements = this lane query
+          // position). NO vector.extract -> stays in vector regs -> compiles to vle
+          // (per-lane), not a scalar flw that would read lane 0 for every lane.
+          %qpos_bcast  = affine.vector_load %qpos_buffer[0, 0] : {{ qpos_desc.get_mlir_shape(acc_stype) }}, vector<{{ chunk_size }}x{{ acc_stype }}>
           affine.for %mindex = 0 to {{ tile_s }} step {{ chunk_size }} {
             // within-lane key positions: index2 + mindex + (0..chunk_size-1)
             %kbase_idx  = arith.addi %index2, %mindex : index
@@ -490,10 +491,15 @@ FLASH_SDPA_CAUSAL_TEMPLATE = (
         _QPOS_MVIN + "        affine.for %index2 = 0 to {{ s }} step {{ tile_s }} {",
         1,
     )
-    # inject the causal mask before the online-softmax max reduction
+    # Inject the causal mask right after the QK matmul and before the FUSED
+    # scale+max pass (so the row-max sees the masked scores). NOTE: the previous
+    # anchor "// Find new max." was removed when scale+max were fused into one
+    # pass, which silently made this .replace a no-op -> the mask was never
+    # emitted and causal attention computed the non-causal result. Anchor on the
+    # FUSED scale+max comment, which exists in the current template.
     .replace(
-        "          // Find new max.",
-        _CAUSAL_MASK_BLOCK + "          // Find new max.",
+        "          // FUSED scale+max (was 2 passes): scale scores by c_scale, store the",
+        _CAUSAL_MASK_BLOCK + "          // FUSED scale+max (was 2 passes): scale scores by c_scale, store the",
         1,
     )
 )
@@ -528,19 +534,32 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         # used for prefill). One (batch, kv_head) group per outer iteration; g query heads
         # map one-per-lane within a group, so every lane in a tile shares the same K/V.
         if self.is_decode:
+            # Decode (L==1): treat each query head as a degenerate prefill. Broadcast
+            # its single token across ALL vector_lane lanes (l = vector_lane; q/out
+            # per-lane stride 0). The outer loop runs over every query head (b = N*Hq);
+            # KV is mapped query-head -> kv-head by floordiv(g) exactly like prefill
+            # GQA, so the g consecutive heads sharing a KV head reuse it from L2 (no
+            # extra DRAM traffic). Filling all lanes is REQUIRED: the systolic matmul
+            # writeback only lays out [M=tile_e within-lane, N=tile_l across-lane]
+            # correctly when the query-tile loop bound (l) and tile_l == vector_lane;
+            # l=1 (one lane) collapses the output to a single D element.
             n_orig  = int(query.get_layout().size[0])
             hq_orig = int(query.get_layout().size[-3])
-            h_orig  = int(key.get_layout().size[-3])
-            g_dec   = hq_orig // h_orig if h_orig else hq_orig
-            b = n_orig * h_orig          # number of (batch, kv_head) groups
-            l = g_dec                    # lane extent = query heads per group
+            b = n_orig * hq_orig         # one outer iteration per query head
+            l = kernel.vector_lane       # broadcast the single token across all lanes
 
         if tile_info is None:
             tile_l, tile_s, tile_e, subtile_l, subtile_s, subtile_e = self.select_tile(kernel, l, s, e, n_extra_node, 0, n_prologue_node)[0]
         else:
             tile_l, tile_s, tile_e, subtile_l, subtile_s, subtile_e = tile_info
 
-        TOG_latency = l if tile_l > l else tile_l
+        # Decode g==1 broadcasts the single query across all tile_l(=vector_lane)
+        # lanes, so the VALID lane extent is tile_l, not l(=1). Using l here would
+        # set loop_size[lane]=1 and the matmul would only populate one lane/column.
+        if self.is_decode and l == 1:
+            TOG_latency = tile_l
+        else:
+            TOG_latency = l if tile_l > l else tile_l
         kernel.loop_size = [TOG_latency, tile_s, tile_e]
 
         # Select template code
@@ -648,40 +667,38 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         sum_desc.set_tile_size_stride(sum_size, sum_stride)
         sum_desc.set_name("sum_buffer")
 
-        # Per-lane query-position buffer (causal mask only): qpos_buffer[lane] = index1 + lane_id.
-        # Same per-lane layout as max/sum (vlane_split_axis=0, [tile_l, 2]).
-        vlane_split_axis = 0
-        qpos_size = [tile_l, 2]
-        qpos_stride = [2, 1]
-        qpos_desc = mlir_common.MLIRMultiDimTile(qpos_size, kernel.vector_lane, vlane_split_axis, vlane_stride)
-        qpos_desc.set_tile_size_stride(qpos_size, qpos_stride)
-        qpos_desc.set_name("qpos_buffer")
-
         # For reduction.
         # chunk_size = the per-op vector width of the online-softmax loops. The
         # sim charges 1 cycle per vector instruction regardless of width, so wider
-        # chunks => fewer loop iterations => fewer load/store/vsetvli/arith
-        # instructions => far fewer cycles (measured: 8->32 halves total cycles).
-        # Cap at 32: in the f16 path the extf widening f16->f32 at chunk=32 is
-        # source EMUL m2 -> dest m4 (legal, dest LMUL<=8); chunk=64 would be dest
-        # m8 and hits the gem5 "LMUL=8 illegal for widening" panic. Also bounded by
-        # tile_s (the loop trip count) and stays a power of 2.
+        # chunks => fewer loop iterations => far fewer cycles (measured: 8->32 halves).
+        # Cap at 32 (f16 widening LMUL constraint), bounded by tile_s, power of 2.
         chunk_size = max(2, min(32, tile_s))
-        # Decode (is_decode): CALIBRATION, not a first-principles value. Real v6e
-        # splash decode device-time (measured across S=256..4096) implies a per-key
-        # softmax throughput ~16x lower than the sim's wide-vector (chunk=64) default
-        # -- i.e. real decode's softmax is far less throughput-efficient than our
-        # vectorized one. A narrow chunk reproduces that per-key cost: chunk=4 lands
-        # decode within ~30% of real for S>=512 (per-key slope matches real's
-        # ~0.0066us/key). This only narrows DECODE's softmax; prefill keeps chunk=64.
-        # NOTE: this is fitted to measured TPU, not derived from N-UPU hardware; the
-        # remaining S=256 gap is the ~4.3us per-kernel floor the sim does not model.
+        # Decode (is_decode): CALIBRATION fitted to measured v6e splash decode
+        # device-time (per-key softmax throughput ~16x lower than the wide-vector
+        # default); chunk=4 lands decode within ~30 percent of real for S>=512.
+        # Prefill keeps the wide chunk. Not derived from N-UPU hardware.
         if self.is_decode:
             chunk_size = 4
         import os as _os
         _cs = _os.environ.get("TORCHSIM_FLASH_CHUNK")
         if _cs:
             chunk_size = int(_cs)
+
+        # Per-lane query-position buffer (causal mask only): each lane holds its query
+        # position (index1 + lane_id), replicated chunk_size times so the mask reads it
+        # as a plain vector<chunk_size> via a per-lane vle. CRITICAL: the position MUST
+        # stay in the vector domain. A vector<2> load + vector.extract[0] folds to a
+        # SCALAR flw (confirmed in asm), which ignores the per-lane vu_sram_byte offset
+        # and reads lane 0 for every lane -- so the whole tile gets the tile-base
+        # position. Loading the full chunk_size vector and comparing it directly keeps
+        # it per-lane, exactly like mul_buffer. The MVIN broadcasts one DRAM iota
+        # element across the chunk axis (dram_stride 0) so all copies equal the row.
+        vlane_split_axis = 0
+        qpos_size = [tile_l, chunk_size]
+        qpos_stride = [chunk_size, 1]
+        qpos_desc = mlir_common.MLIRMultiDimTile(qpos_size, kernel.vector_lane, vlane_split_axis, vlane_stride)
+        qpos_desc.set_tile_size_stride(qpos_size, qpos_stride)
+        qpos_desc.set_name("qpos_buffer")
 
         # DMA strides and offset affine maps (dram_stride + dram_offset style)
         q_dram_stride  = [int(q_stride[0]), int(q_stride[1]), int(q_stride[2])]
@@ -697,24 +714,24 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         g  = hq // h if h else 1
 
         if self.is_decode:
-            # Decode lane axis = query-head-group g. The outer loop %index0 now ranges over
-            # (batch, kv_head) GROUPS (0..N*Hkv), NOT query heads. Within a group the g query
-            # heads (each a single decode token, L==1) map one-per-lane along the q tile's
-            # vlane_split_axis (axis 1). So the per-lane DRAM stride MUST be the query-HEAD
-            # stride q_stride[-3], not the L stride; and the group base advances by g heads.
+            # index0 = query head (0..N*Hq). Broadcast the single decode token across
+            # all lanes: per-lane (vlane, axis 1) DRAM stride 0 for q (read one head
+            # into every lane) and out (every lane writes the identical result to one
+            # DRAM address -> unique-addr model keeps write traffic flat). KV head =
+            # index0 floordiv g (prefill GQA mapping); g consecutive heads share it.
             q_head_stride   = int(query.get_layout().stride[-3])
             q_d_stride      = int(query.get_layout().stride[-1])
             out_head_stride = int(out.get_layout().stride[-3])
             out_d_stride    = int(out.get_layout().stride[-1])
-            # [group base stride, per-lane (head) stride, D stride]
-            q_dram_stride   = [g * q_head_stride, q_head_stride, q_d_stride]
-            out_dram_stride = [g * out_head_stride, out_head_stride, out_d_stride]
+            # [query-head base stride, per-lane stride (0 = broadcast), D stride]
+            q_dram_stride   = [q_head_stride, 0, q_d_stride]
+            out_dram_stride = [out_head_stride, 0, out_d_stride]
             # K/V: %index0 already indexes the flattened kv-group (batch*Hkv+kv_head), whose
             # dim-0 stride after the [-1,S,D] view is exactly S*D. So all lanes in the group
             # read the SAME KV head with a plain offset map (no GQA floordiv needed here).
             q_offset_map   = _make_offset_map(q_dram_stride,   q_tile_desc.offset)
-            k_offset_map   = _make_offset_map(k_dram_stride,   k_tile_desc.offset)
-            v_offset_map   = _make_offset_map(v_dram_stride,   v_tile_desc.offset)
+            k_offset_map   = _make_offset_map_gqa(k_dram_stride, g, k_tile_desc.offset)
+            v_offset_map   = _make_offset_map_gqa(v_dram_stride, g, v_tile_desc.offset)
             out_offset_map = _make_offset_map(out_dram_stride, 0)
         else:
             q_offset_map   = _make_offset_map(q_dram_stride,   q_tile_desc.offset)
@@ -724,7 +741,7 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
 
         # Causal-mask iota: [l, 2] DRAM tensor (row i = [i, i]), distributed one row
         # per lane. Tile is [tile_l, 2]; base address for query-tile index1 is index1*2.
-        qpos_dram_stride = [2, 1]
+        qpos_dram_stride = [2, 0]
         qpos_offset_map  = _make_offset_map([2], 0)
 
         # Keep out_idx only for epilogue_info (not in render_options)
@@ -821,7 +838,18 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         # assumptions in the transposed reinterpret_cast and the loop-padding pass.
         # Clamp tile_l to l so the tile uses exactly the valid lanes. Prefill keeps
         # tile_l = vector_lane (its l = query-seq is always a multiple of it).
-        _tile_l = min(kernel.vector_lane, l) if self.is_decode else kernel.vector_lane
+        if self.is_decode:
+            # g==1 (MHA-decode, l==1): pad tile_l to vector_lane and broadcast the
+            # single query across all lanes (q/out per-lane stride 0). The systolic
+            # matmul writeback only lays out [M=tile_e within-lane, N=tile_l across-
+            # lane] correctly when N==vector_lane; tile_l=1 scatters M across lanes
+            # and the per-lane readback recovers only a strided fraction. All lanes
+            # recompute the same query (lanes are parallel -> latency-neutral) and
+            # MVOUT broadcasts back to one address (unique-addr DRAM model -> no
+            # extra traffic). g>1 (GQA) needs per-head lane-block replication (TODO).
+            _tile_l = kernel.vector_lane if l == 1 else min(kernel.vector_lane, l)
+        else:
+            _tile_l = kernel.vector_lane
         tile_candidates = [[_tile_l, _tile_s, e]]
 
         for idx, (tile_l, tile_s, tile_e) in enumerate(tile_candidates):
