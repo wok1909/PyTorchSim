@@ -7,10 +7,19 @@ from m5.objects import *
 _SFU_OPLAT = int(_os.environ.get("TORCHSIM_SFU_OPLAT", "10"))
 _SFU_ISSUELAT = _os.environ.get("TORCHSIM_SFU_ISSUELAT")
 
+# Systolic-array fill/drain latency. opLat=1 models a 0-depth array (a result in
+# 1 cycle), which is unphysical for a DxD weight-stationary array: loading the
+# stationary operand + propagating data through the array takes ~array-depth
+# cycles. With issueLat=1 the FU stays pipelined (1 matmul/cycle once filled), so
+# a full-width tile amortizes the fill while a skinny (decode) tile pays it. This
+# is the term the model was missing for single-token decode. Default 1 = prior
+# behavior; set TORCHSIM_MXU_OPLAT to the array depth to enable.
+_MXU_OPLAT = int(_os.environ.get("TORCHSIM_MXU_OPLAT", "1"))
+
 class SystolicArray(MinorFU):
     unitType = "SystolicArray"
     opClasses = minorMakeOpClassSet(["CustomMatMul", "CustomMatMuliVpush", "CustomMatMulwVpush", "CustomMatMulvpop"])
-    opLat = 1
+    opLat = _MXU_OPLAT
     systolicArrayWidth = 128
     systolicArrayHeight = 128
 

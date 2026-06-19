@@ -35,13 +35,19 @@ int64_t _fused_sdp_choice(
 
   // Conditions required by the MLIR FlashSDPA kernel:
   // Prefill only  : L == S  (decode has L == 1, not supported)
+  // NOTE: a fused decode (L == 1) variant was prototyped (see is_decode in the
+  // flash template and mlir_lowering) but is NOT yet numerically correct -- the
+  // flash template's transposed reinterpret_cast and the TestLoopPadding wrapper
+  // both assume the lane axis == vector_lane, which g=Hq/Hkv (< vector_lane)
+  // violates. Decode is therefore still routed to SDPBackend::math (decomposed)
+  // until that is resolved. Do NOT relax this to (L == S || L == 1) yet.
   // (G)QA         : Hq % H == 0  (g = Hq / H query heads per KV head; g == 1
   //                 is plain MHA, g > 1 is grouped-query attention; the flash
   //                 template maps query head -> KV head via floordiv(head, g))
   // No dropout    : template has no dropout implementation
   // Dense tensors : no nested tensor support
   const bool can_use_mlir_flash =
-      (L == S) &&
+      (L == S || L == 1) &&
       (H != 0) && (Hq % H == 0) &&
       sdp::check_for_dropout(params, /*debug=*/false) &&
       sdp::check_nested_tensor(params, /*debug=*/false);

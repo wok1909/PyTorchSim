@@ -107,6 +107,14 @@ def _mlir_tuned_flash_sdpa(
     scale = calculate_scale(query, scale)
     N, Hq, H, L, S, E, Ev, layout, query, key, value = flash_sdpa_args(query, key, value)
     input_nodes = [query, key, value]
+    # Decode (single query token, L == 1): a fused decode variant was prototyped
+    # (MLIRFlashSDPATemplate(..., is_decode=True), which maps the query-head-group
+    # g = Hq/H onto the VPU lanes instead of the query sequence L). It is NOT yet
+    # numerically correct (the flash template's transposed reinterpret_cast and the
+    # TestLoopPadding wrapper both assume the lane axis == vector_lane, which g < 256
+    # violates), so decode is NOT routed here -- _fused_sdp_choice keeps L == 1 on
+    # SDPBackend::math. To re-enable once fixed: relax that C++ check to (L == S ||
+    # L == 1) and dispatch is_decode=True here when int(L) == 1.
     if is_causal:
         # Per-lane query-position iota: [L, 2] f32 (row i = [i, i]), MVIN'd one row
         # per lane by the causal template so lane c reads query position index1 + c.
@@ -124,7 +132,11 @@ def _mlir_tuned_flash_sdpa(
         qpos_tb.realize()
         qpos_node = ir.ExternKernel.require_stride1(qpos_tb)
         input_nodes = [query, key, value, qpos_node]
-    mlir_template = MLIRFlashSDPATemplate(input_nodes, layout, scale, is_causal=is_causal)
+    # Decode (single query token, L == 1): route to the fused flash template with
+    # is_decode=True, which maps the query-head-group g = Hq/H onto the VPU lanes
+    # instead of the query sequence L (every lane in a group shares the same K/V).
+    is_decode = (int(L) == 1)
+    mlir_template = MLIRFlashSDPATemplate(input_nodes, layout, scale, is_causal=is_causal, is_decode=is_decode)
     return (mlir_template.generate().output_node(), None, None, None, None, None, None, None, None)
 
 

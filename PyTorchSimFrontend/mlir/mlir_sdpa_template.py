@@ -500,10 +500,14 @@ FLASH_SDPA_CAUSAL_TEMPLATE = (
 
 
 class MLIRFlashSDPATemplate(MLIRTemplate):
-    def __init__(self, input_nodes, layout, scale, input_reorder=None, is_causal=False):
+    def __init__(self, input_nodes, layout, scale, input_reorder=None, is_causal=False, is_decode=False):
         super().__init__("kernel", input_nodes, layout, input_reorder)
         self.scale = scale
         self.is_causal = is_causal
+        # Decode (single query token, L==1): reinterpret the VPU lane axis to be the
+        # query-head-group g = Hq/Hkv instead of the query sequence L. One (batch, kv_head)
+        # group is processed per outer iteration so every lane shares the same K/V.
+        self.is_decode = is_decode
 
     def render(self,
                kernel: MLIRTemplateKernel,
@@ -518,6 +522,18 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
 
         # Causal mask uses a 4th input (per-lane query-position iota); None for non-causal.
         qpos = self.input_nodes[3] if self.is_causal else None
+
+        # Decode: lane axis = query-head-group g (not L). Recompute the outer-loop count
+        # b and the lane-extent l from the ORIGINAL 4D layout (NOT the flattened b=N*Hq
+        # used for prefill). One (batch, kv_head) group per outer iteration; g query heads
+        # map one-per-lane within a group, so every lane in a tile shares the same K/V.
+        if self.is_decode:
+            n_orig  = int(query.get_layout().size[0])
+            hq_orig = int(query.get_layout().size[-3])
+            h_orig  = int(key.get_layout().size[-3])
+            g_dec   = hq_orig // h_orig if h_orig else hq_orig
+            b = n_orig * h_orig          # number of (batch, kv_head) groups
+            l = g_dec                    # lane extent = query heads per group
 
         if tile_info is None:
             tile_l, tile_s, tile_e, subtile_l, subtile_s, subtile_e = self.select_tile(kernel, l, s, e, n_extra_node, 0, n_prologue_node)[0]
@@ -651,6 +667,17 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         # m8 and hits the gem5 "LMUL=8 illegal for widening" panic. Also bounded by
         # tile_s (the loop trip count) and stays a power of 2.
         chunk_size = max(2, min(32, tile_s))
+        # Decode (is_decode): CALIBRATION, not a first-principles value. Real v6e
+        # splash decode device-time (measured across S=256..4096) implies a per-key
+        # softmax throughput ~16x lower than the sim's wide-vector (chunk=64) default
+        # -- i.e. real decode's softmax is far less throughput-efficient than our
+        # vectorized one. A narrow chunk reproduces that per-key cost: chunk=4 lands
+        # decode within ~30% of real for S>=512 (per-key slope matches real's
+        # ~0.0066us/key). This only narrows DECODE's softmax; prefill keeps chunk=64.
+        # NOTE: this is fitted to measured TPU, not derived from N-UPU hardware; the
+        # remaining S=256 gap is the ~4.3us per-kernel floor the sim does not model.
+        if self.is_decode:
+            chunk_size = 4
         import os as _os
         _cs = _os.environ.get("TORCHSIM_FLASH_CHUNK")
         if _cs:
@@ -669,10 +696,31 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         h  = int(key.get_layout().size[-3])
         g  = hq // h if h else 1
 
-        q_offset_map   = _make_offset_map(q_dram_stride,   q_tile_desc.offset)
-        k_offset_map   = _make_offset_map_gqa(k_dram_stride, g, k_tile_desc.offset)
-        v_offset_map   = _make_offset_map_gqa(v_dram_stride, g, v_tile_desc.offset)
-        out_offset_map = _make_offset_map(out_dram_stride, 0)
+        if self.is_decode:
+            # Decode lane axis = query-head-group g. The outer loop %index0 now ranges over
+            # (batch, kv_head) GROUPS (0..N*Hkv), NOT query heads. Within a group the g query
+            # heads (each a single decode token, L==1) map one-per-lane along the q tile's
+            # vlane_split_axis (axis 1). So the per-lane DRAM stride MUST be the query-HEAD
+            # stride q_stride[-3], not the L stride; and the group base advances by g heads.
+            q_head_stride   = int(query.get_layout().stride[-3])
+            q_d_stride      = int(query.get_layout().stride[-1])
+            out_head_stride = int(out.get_layout().stride[-3])
+            out_d_stride    = int(out.get_layout().stride[-1])
+            # [group base stride, per-lane (head) stride, D stride]
+            q_dram_stride   = [g * q_head_stride, q_head_stride, q_d_stride]
+            out_dram_stride = [g * out_head_stride, out_head_stride, out_d_stride]
+            # K/V: %index0 already indexes the flattened kv-group (batch*Hkv+kv_head), whose
+            # dim-0 stride after the [-1,S,D] view is exactly S*D. So all lanes in the group
+            # read the SAME KV head with a plain offset map (no GQA floordiv needed here).
+            q_offset_map   = _make_offset_map(q_dram_stride,   q_tile_desc.offset)
+            k_offset_map   = _make_offset_map(k_dram_stride,   k_tile_desc.offset)
+            v_offset_map   = _make_offset_map(v_dram_stride,   v_tile_desc.offset)
+            out_offset_map = _make_offset_map(out_dram_stride, 0)
+        else:
+            q_offset_map   = _make_offset_map(q_dram_stride,   q_tile_desc.offset)
+            k_offset_map   = _make_offset_map_gqa(k_dram_stride, g, k_tile_desc.offset)
+            v_offset_map   = _make_offset_map_gqa(v_dram_stride, g, v_tile_desc.offset)
+            out_offset_map = _make_offset_map(out_dram_stride, 0)
 
         # Causal-mask iota: [l, 2] DRAM tensor (row i = [i, i]), distributed one row
         # per lane. Tile is [tile_l, 2]; base address for query-tile index1 is index1*2.
@@ -766,7 +814,15 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         import os as _os
         _ts = _os.environ.get("TORCHSIM_FLASH_TILE_S")
         _tile_s = min(int(_ts), s) if _ts else kernel.vector_lane
-        tile_candidates = [[kernel.vector_lane, _tile_s, e]]
+        # Decode (is_decode): only l = g = Hq/Hkv query heads are valid, and g is
+        # typically < vector_lane. A full vector_lane-wide tile_l would (1) read
+        # garbage in the unused lanes (q DRAM only has g heads) and (2) make the
+        # outer l-loop bound (g) < step (vector_lane), tripping the lane-invariant
+        # assumptions in the transposed reinterpret_cast and the loop-padding pass.
+        # Clamp tile_l to l so the tile uses exactly the valid lanes. Prefill keeps
+        # tile_l = vector_lane (its l = query-seq is always a multiple of it).
+        _tile_l = min(kernel.vector_lane, l) if self.is_decode else kernel.vector_lane
+        tile_candidates = [[_tile_l, _tile_s, e]]
 
         for idx, (tile_l, tile_s, tile_e) in enumerate(tile_candidates):
             subtile_l = tile_l if (tile_l < kernel.vector_lane) or n_prologue_node else kernel.vector_lane
