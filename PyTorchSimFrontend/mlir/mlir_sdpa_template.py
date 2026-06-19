@@ -668,17 +668,15 @@ class MLIRFlashSDPATemplate(MLIRTemplate):
         sum_desc.set_name("sum_buffer")
 
         # For reduction.
-        # chunk_size = the per-op vector width of the online-softmax loops. The
-        # sim charges 1 cycle per vector instruction regardless of width, so wider
-        # chunks => fewer loop iterations => far fewer cycles (measured: 8->32 halves).
-        # Cap at 32 (f16 widening LMUL constraint), bounded by tile_s, power of 2.
-        chunk_size = max(2, min(32, tile_s))
-        # Decode (is_decode): CALIBRATION fitted to measured v6e splash decode
-        # device-time (per-key softmax throughput ~16x lower than the wide-vector
-        # default); chunk=4 lands decode within ~30 percent of real for S>=512.
-        # Prefill keeps the wide chunk. Not derived from N-UPU hardware.
-        if self.is_decode:
-            chunk_size = 4
+        # chunk_size = the per-op vector width of the online-softmax loops. The sim
+        # charges ~1 cycle per vector instruction regardless of width, so use the honest
+        # MAX the VPU can do in one instruction: the f16->f32 widening caps the f32 dest
+        # at LMUL<=4, so chunk <= vlen_bits/8 (vlen512 -> 64, vlen256 -> 32). Bounded by
+        # tile_s, power of 2. (Previously decode force-set chunk=4 -- a latency fudge that
+        # artificially narrowed the VPU softmax to match real splash decode, which
+        # under-utilizes the modeled VPU. Removed: decode now uses the same honest max.)
+        _chunk_cap = max(2, extension_config.vpu_vector_length_bits // 8)
+        chunk_size = max(2, min(_chunk_cap, tile_s))
         import os as _os
         _cs = _os.environ.get("TORCHSIM_FLASH_CHUNK")
         if _cs:
