@@ -1,9 +1,8 @@
 import os
 import sys
-import io
 import re
 import json
-import contextlib
+import tempfile
 import argparse
 
 import torch
@@ -49,19 +48,33 @@ def run_one(mode, batch, seq):
     v = torch.rand(batch, HKV, seq, D, dtype=torch.float16)
 
     opt = torch.compile(F.scaled_dot_product_attention, dynamic=False)
-    buf = io.StringIO()
-    with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
-        with torch.no_grad(), TOGSimulator():
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+    # TOGSim prints "Total execution cycles" via spdlog to the real stderr fd, which
+    # a Python-level contextlib.redirect_stdout does NOT capture. Redirect fds 1/2 to
+    # a temp file so we catch the C++ simulator output, then restore.
+    tf = tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt")
+    old1, old2 = os.dup(1), os.dup(2)
+    try:
+        sys.stdout.flush(); sys.stderr.flush()
+        os.dup2(tf.fileno(), 1); os.dup2(tf.fileno(), 2)
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
+            with torch.no_grad(), TOGSimulator():
                 out = opt(q.to(device), k.to(device), v.to(device),
                           attn_mask=None, dropout_p=0.0, is_causal=causal, enable_gqa=True)
                 torch.npu.synchronize()
-    cyc = _cycles_from_log(buf.getvalue())
+        sys.stdout.flush(); sys.stderr.flush()
+    finally:
+        os.dup2(old1, 1); os.dup2(old2, 2); os.close(old1); os.close(old2)
+    tf.flush(); tf.seek(0)
+    log = open(tf.name).read()
+    os.unlink(tf.name)
+    cyc = _cycles_from_log(log)
     tag = f"{mode}_B{batch}_S{seq}"
     if cyc:
         print(f"  {tag:18} cycles={cyc:>12,}  ({cyc / FREQ_MHZ:8.2f} us)", flush=True)
     else:
-        print(f"  {tag:18} cycles=NA (no 'Total execution cycles' in log)", flush=True)
+        # surface the tail of the captured log so failures are diagnosable
+        tail = "\n".join(log.splitlines()[-15:])
+        print(f"  {tag:18} cycles=NA (no 'Total execution cycles')\n--- last log lines ---\n{tail}", flush=True)
     return cyc
 
 
