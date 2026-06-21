@@ -46,8 +46,14 @@ int64_t _fused_sdp_choice(
   //                 template maps query head -> KV head via floordiv(head, g))
   // No dropout    : template has no dropout implementation
   // Dense tensors : no nested tensor support
+  // Chunked prefill (1 < L < S): route to the fused bottom-right-causal flash
+  // template ONLY when L >= 256 (== vpu_vector_lane for the v6e config). The
+  // template maps the query axis onto vector_lane lanes; L < vector_lane leaves
+  // lanes unfilled and the systolic writeback scatters (same limitation as the
+  // decode caveat above), so small-query chunks stay decomposed. L >= 256 fills
+  // all lanes -> writeback correct. (LUT measurement skips query < 256.)
   const bool can_use_mlir_flash =
-      (L == S || L == 1) &&
+      (L == S || L == 1 || (L >= 256 && L < S)) &&
       (H != 0) && (Hq % H == 0) &&
       sdp::check_for_dropout(params, /*debug=*/false) &&
       sdp::check_nested_tensor(params, /*debug=*/false);

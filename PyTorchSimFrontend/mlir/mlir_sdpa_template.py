@@ -391,11 +391,17 @@ func.func @{{ KERNEL_NAME }}{{kernel.def_kernel(inputs=[query, key, value], outp
         %one_2x = vector.broadcast %c1 : {{ acc_stype }} to vector<2x{{ acc_stype }}>
 
         %reciprocal_row_sum_2x = arith.divf %one_2x, %final_row_sum : vector<2x{{ acc_stype }}>
-        %reciprocal_scalar = vector.extract %reciprocal_row_sum_2x[0] : {{ acc_stype }} from vector<2x{{ acc_stype }}>
+        // PER-LANE reciprocal: replicate this lane's 1/row_sum across the multiply
+        // width with vector.shuffle (stays in vector regs), NOT vector.extract[0] +
+        // broadcast. A scalar extract folds to an flw that reads lane 0 for every
+        // lane, collapsing the per-query normalization to query 0's reciprocal --
+        // harmless for non-causal (all row_sums equal) but it leaves causal output
+        // un-normalized (every query divided by query-0's 1/sum). Same per-lane fix
+        // class as the qpos causal-mask read.
 
 {% if io_stype != acc_stype %}
         // f16 path: chunked extf/truncf (widening-convert LMUL constraint, see above).
-        %reciprocal_bcast_c = vector.broadcast %reciprocal_scalar : {{ acc_stype }} to vector<{{ chunk_size }}x{{ acc_stype }}>
+        %reciprocal_bcast_c = vector.shuffle %reciprocal_row_sum_2x, %reciprocal_row_sum_2x [{% for i in range(chunk_size) %}0{% if not loop.last %}, {% endif %}{% endfor %}] : vector<2x{{ acc_stype }}>, vector<2x{{ acc_stype }}>
         affine.for %nindex = 0 to {{ tile_e }} step {{ chunk_size }} {
           %fn_io  = affine.vector_load %ot_buffer2D[0, %nindex] : memref<{{ tile_e }}x{{ tile_l }}x{{ io_stype }}, 1>, vector<{{ chunk_size }}x{{ io_stype }}>
           %fn_f   = arith.extf %fn_io : vector<{{ chunk_size }}x{{ io_stype }}> to vector<{{ chunk_size }}x{{ acc_stype }}>
@@ -404,7 +410,7 @@ func.func @{{ KERNEL_NAME }}{{kernel.def_kernel(inputs=[query, key, value], outp
           affine.vector_store %fn_out, %ot_buffer2D[0, %nindex] : memref<{{ tile_e }}x{{ tile_l }}x{{ io_stype }}, 1>, vector<{{ chunk_size }}x{{ io_stype }}>
         }
 {% else %}
-        %reciprocal_bcast_e = vector.broadcast %reciprocal_scalar : {{ acc_stype }} to vector<{{ tile_e }}x{{ acc_stype }}>
+        %reciprocal_bcast_e = vector.shuffle %reciprocal_row_sum_2x, %reciprocal_row_sum_2x [{% for i in range(tile_e) %}0{% if not loop.last %}, {% endif %}{% endfor %}] : vector<2x{{ acc_stype }}>, vector<2x{{ acc_stype }}>
         %accumulated_out = affine.vector_load %ot_buffer2D[0, 0] : memref<{{ tile_e }}x{{ tile_l }}x{{ acc_stype }}, 1>, vector<{{ tile_e }}x{{ acc_stype }}>
         %stable_final_out = arith.mulf %accumulated_out, %reciprocal_bcast_e : vector<{{ tile_e }}x{{ acc_stype }}>
         affine.vector_store %stable_final_out, %ot_buffer2D[0, 0] : memref<{{ tile_e }}x{{ tile_l }}x{{ acc_stype }}, 1>, vector<{{ tile_e }}x{{ acc_stype }}>
@@ -437,6 +443,12 @@ _CAUSAL_MASK_BLOCK = r"""
           // position). NO vector.extract -> stays in vector regs -> compiles to vle
           // (per-lane), not a scalar flw that would read lane 0 for every lane.
           %qpos_bcast  = affine.vector_load %qpos_buffer[0, 0] : {{ qpos_desc.get_mlir_shape(acc_stype) }}, vector<{{ chunk_size }}x{{ acc_stype }}>
+          // Bottom-right causal: the q query tokens sit at the END of the kv sequence,
+          // so token i (qpos = index1 + lane) attends kv[0 .. (s-l)+qpos]. Shift the
+          // query position by (kv_seq - q_seq) = (s - l). For prefill (q==kv) s-l==0,
+          // so this is a no-op add and reduces to top-left. (s>=l always; q<=kv.)
+          %qpos_broff  = arith.constant dense<{{ s - l }}.0> : vector<{{ chunk_size }}x{{ acc_stype }}>
+          %qpos_abs    = arith.addf %qpos_bcast, %qpos_broff : vector<{{ chunk_size }}x{{ acc_stype }}>
           affine.for %mindex = 0 to {{ tile_s }} step {{ chunk_size }} {
             // within-lane key positions: index2 + mindex + (0..chunk_size-1)
             %kbase_idx  = arith.addi %index2, %mindex : index
@@ -447,8 +459,8 @@ _CAUSAL_MASK_BLOCK = r"""
             %kiota_i32  = arith.index_cast %kiota_idx : vector<{{ chunk_size }}xindex> to vector<{{ chunk_size }}xi32>
             %kiota_f    = arith.sitofp %kiota_i32 : vector<{{ chunk_size }}xi32> to vector<{{ chunk_size }}x{{ acc_stype }}>
             %kpos_vec   = arith.addf %kbase_vec, %kiota_f : vector<{{ chunk_size }}x{{ acc_stype }}>
-            // mask iff global_key > global_query
-            %mask_pred  = arith.cmpf ogt, %kpos_vec, %qpos_bcast : vector<{{ chunk_size }}x{{ acc_stype }}>
+            // mask iff global_key > global_query (bottom-right aligned via qpos_abs)
+            %mask_pred  = arith.cmpf ogt, %kpos_vec, %qpos_abs : vector<{{ chunk_size }}x{{ acc_stype }}>
 {% if io_stype != acc_stype %}
             %cur_scores_io = affine.vector_load %mul_buffer[0, %mindex] : {{ mul_tile_desc.get_mlir_shape(io_stype) }}, vector<{{ chunk_size }}x{{ io_stype }}>
             %cur_scores = arith.extf %cur_scores_io : vector<{{ chunk_size }}x{{ io_stype }}> to vector<{{ chunk_size }}x{{ acc_stype }}>
@@ -488,12 +500,16 @@ FLASH_SDPA_CAUSAL_TEMPLATE = (
     # MVIN the per-lane query iota once per query-tile, before the KV loop
     .replace(
         "        affine.for %index2 = 0 to {{ s }} step {{ tile_s }} {",
-        # Causal block-skip: cap the KV loop at min(S, index1 + tile_l) so KV blocks
-        # fully in the future of the query tile are not iterated. Functionally Spike
-        # honors this directly; for TIMING, tog_generator re-extracts this min bound
-        # from the .mlir and emits a dependent loop_end that TOGSim's TileLoopNode
-        # caps per query-tile (the LLVM TOG pass drops the min's dependent term).
-        _QPOS_MVIN + "        affine.for %index2 = 0 to min affine_map<(d0) -> ({{ s }}, d0 + {{ tile_l }})>(%index1) step {{ tile_s }} {",
+        # Bottom-right causal block-skip: the q query tokens sit at the END of the kv
+        # sequence, so the query tile starting at index1 (abs key range up to
+        # (s-l)+index1+tile_l) attends kv up to min(s, index1 + (s-l) + tile_l). KV
+        # blocks fully in the future of the tile are not iterated. For prefill (s==l)
+        # the offset (s-l) is 0 -> min(s, index1 + tile_l) = the original top-left bound
+        # (no behavior change). Spike honors this directly; for TIMING, tog_generator
+        # re-extracts this min bound from the .mlir and emits a dependent loop_end that
+        # TOGSim's TileLoopNode caps per query-tile (the LLVM TOG pass drops the min's
+        # dependent term). The constant (s-l+tile_l) flows through unchanged.
+        _QPOS_MVIN + "        affine.for %index2 = 0 to min affine_map<(d0) -> ({{ s }}, d0 + {{ s - l + tile_l }})>(%index1) step {{ tile_s }} {",
         1,
     )
     # Inject the causal mask right after the QK matmul and before the FUSED
